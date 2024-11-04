@@ -31,6 +31,7 @@ class WinUSB:
         self.dids_url = "https://api.github.com/repos/dids/clover-builder/releases"
         self.oc_url = "https://api.github.com/repos/acidanthera/OpenCorePkg/releases"
         self.oc_boot = "boot"
+        self.oc_boot_alt = "bootX64"
         self.oc_boot0 = "boot0"
         self.oc_boot1 = "boot1f32"
         # self.oc_boot_url = "https://github.com/acidanthera/OpenCorePkg/raw/master/Utilities/LegacyBoot/"
@@ -42,7 +43,9 @@ class WinUSB:
         self.z_path32 = os.path.join(os.environ['SYSTEMDRIVE'] + "\\", "Program Files (x86)", "7-Zip", "7z.exe")
         self.recovery_suffixes = (
             "recoveryhdupdate.pkg",
-            "recoveryhdmetadmg.pkg"
+            "recoveryhdmetadmg.pkg",
+            "basesystem.dmg",
+            "recoveryimage.dmg"
         )
         self.dd_bootsector = True
         self.boot0 = "boot0af"
@@ -128,7 +131,9 @@ class WinUSB:
         return os.path.exists(os.path.join(self.s_path, self.dd_name))
 
     def check_7z(self):
-        self.z_path = self.z_path64 if os.path.exists(self.z_path64) else self.z_path32 if os.path.exists(self.z_path32) else None
+        # Check the PATH var first
+        z_path = self.r.run({"args":["where.exe","7z.exe"]})[0].split("\n")[0].rstrip("\r")
+        self.z_path = next((x for x in (z_path,self.z_path64,self.z_path32) if x and os.path.isfile(x)),None)
         if self.z_path:
             return True
         print("Didn't locate {} - downloading...".format(self.z_name))
@@ -176,12 +181,12 @@ class WinUSB:
         print("")
         return os.path.exists(os.path.join(self.s_path,self.bi_name))
 
-    def get_dl_url_from_json(self,json_data,suffix=".lzma"):
+    def get_dl_url_from_json(self,json_data,suffix=(".lzma",".iso.7z")):
         try: j_list = json.loads(json_data)
         except: return None
         j_list = j_list if isinstance(j_list,list) else [j_list]
         for j in j_list:
-            dl_link = next((x.get("browser_download_url", None) for x in j.get("assets", []) if x.get("browser_download_url", "").lower().endswith(suffix.lower())), None)
+            dl_link = next((x.get("browser_download_url", None) for x in j.get("assets", []) if x.get("browser_download_url", "").endswith(suffix)), None)
             if dl_link: break
         if not dl_link:
             return None
@@ -191,9 +196,25 @@ class WinUSB:
         # Returns the latest download package and info in a
         # dictionary:  { "url" : dl_url, "name" : name, "info" : update_info }
         # Attempt Dids' repo first - falling back on Clover's official repo as needed
-        for url in (self.dids_url,self.clover_url):
-            # Tag is 5098 on Slice's repo, and v2.5k_r5098 on Dids' - accommodate as needed
-            search_url = url if clover_version == None else "{}/tags/{}".format(url,clover_version if url == self.clover_url else "v2.{}k_r{}".format(clover_version[0],clover_version))
+        clover_urls = (self.clover_url,self.dids_url)
+        try:
+            assert int(clover_version) <= 5122 # Check if we're trying to get r5122 or prior
+            # If we didn't throw an exception, we can reverse the order of the URLs to check
+            # Dids' builder first
+            clover_urls = (self.dids_url,self.clover_url)
+        except:
+            pass # Wasn't a proper int, or was above 5122
+        for url in clover_urls:
+            # Tag is e.g. 5098 on Slice's repo, and e.g. v2.5k_r5098 or v5.0_r5xxx on Dids'
+            # accommodate as needed
+            if not clover_version:
+                search_url = url
+            elif url == self.clover_url:
+                # Using CloverHackyColor's repo - set the tag to the version
+                search_url = "{}/tags/{}".format(url,clover_version)
+            else:
+                # Using Dids' clover builder - figure out the prefix based on the version
+                search_url = "{}/tags/v{}_r{}".format(url,"5.0" if clover_version >= "5118" else "2.5k",clover_version)
             print(" - Checking {}".format(search_url))
             json_data = self.dl.get_string(search_url, False)
             if not json_data: print(" --> Not found!")
@@ -203,7 +224,7 @@ class WinUSB:
     def get_oc_dl_info(self):
         json_data = self.dl.get_string(self.oc_url, False)
         if not json_data: print(" --> Not found!")
-        else: return self.get_dl_url_from_json(json_data,"-RELEASE.zip")
+        else: return self.get_dl_url_from_json(json_data,suffix="-RELEASE.zip")
 
     def diskpart_flag(self, disk, as_efi=False):
         # Sets and unsets the GUID needed for a GPT EFI partition ID
@@ -243,7 +264,7 @@ class WinUSB:
         print("")
         self.u.grab("Press [enter] to return...")
 
-    def diskpart_erase(self, disk, gpt=False, clover_version = None):
+    def diskpart_erase(self, disk, gpt=False, clover_version = None, local_file = None):
         # Generate a script that we can pipe to diskpart to erase our disk
         self.u.head("Erasing With DiskPart")
         print("")
@@ -307,9 +328,9 @@ class WinUSB:
         self.d.update()
         print("Relocating disk {}".format(disk["index"]))
         disk = self.d.disks[str(disk["index"])]
-        self.select_package(disk, clover_version)
+        self.select_package(disk, clover_version, local_file=local_file)
 
-    def select_package(self, disk, clover_version = None):
+    def select_package(self, disk, clover_version = None, local_file = None):
         self.u.head("Select Recovery Package")
         print("")
         print("{}. {} - {} ({})".format(
@@ -322,19 +343,20 @@ class WinUSB:
         print("M. Main Menu")
         print("Q. Quit")
         print("")
-        menu = self.u.grab("Please paste the recovery update pkg path to extract:  ")
+        print("(To copy a file's path, shift + right-click in Explorer and select 'Copy as path')\n")
+        menu = self.u.grab("Please paste the recovery update pkg/dmg path to extract:  ")
         if menu.lower() == "q":
             self.u.custom_quit()
         if menu.lower() == "m":
             return
         path = self.u.check_path(menu)
         if not path:
-            self.select_package(disk, clover_version)
+            self.select_package(disk, clover_version, local_file=local_file)
             return
         # Got the package - let's make sure it's named right - just in case
         if os.path.basename(path).lower().endswith(".hfs"):
             # We have an hfs image already - bypass extraction
-            self.dd_image(disk, path, clover_version)
+            self.dd_image(disk, path, clover_version, local_file=local_file)
             return
         # If it's a directory, find the first recovery hit
         if os.path.isdir(path):
@@ -351,39 +373,41 @@ class WinUSB:
             print("Ensure you're passing a proper recovery package.")
             print("")
             self.u.grab("Press [enter] to return to package selection...")
-            self.select_package(disk, clover_version)
+            self.select_package(disk, clover_version, local_file=local_file)
             return
         self.u.head("Extracting Package")
         print("")
         temp = tempfile.mkdtemp()
         cwd = os.getcwd()
         os.chdir(temp)
-        # Extract in sections and remove any files we run into
-        print("Extracting Recovery dmg...")
-        out = self.r.run({"args":[self.z_path, "e", "-txar", path, "*.dmg"]})
-        if out[2] != 0:
-            shutil.rmtree(temp,ignore_errors=True)
-            print("An error occurred extracting: {}".format(out[2]))
-            print("")
-            self.u.grab("Press [enter] to return...")
-            return
-        print("Extracting BaseSystem.dmg...")
-        # No files to delete here - let's extract the next part
-        out = self.r.run({"args":[self.z_path, "e", "*.dmg", "*/Base*.dmg"]})
-        if out[2] != 0:
-            shutil.rmtree(temp,ignore_errors=True)
-            print("An error occurred extracting: {}".format(out[2]))
-            print("")
-            self.u.grab("Press [enter] to return...")
-            return
-        # If we got here - we should delete everything in the temp folder except
-        # for a .dmg that starts with Base
-        del_list = [x for x in os.listdir(temp) if not (x.lower().startswith("base") and x.lower().endswith(".dmg"))]
-        for d in del_list:
-            os.remove(os.path.join(temp, d))
+        print("Located {}...".format(os.path.basename(path)))
+        if not path.lower().endswith(".dmg"):
+            # Extract in sections and remove any files we run into
+            print("Extracting Recovery dmg...")
+            out = self.r.run({"args":[self.z_path, "e", "-txar", path, "*.dmg"]})
+            if out[2] != 0:
+                shutil.rmtree(temp,ignore_errors=True)
+                print("An error occurred extracting: {}".format(out[2]))
+                print("")
+                self.u.grab("Press [enter] to return...")
+                return
+            print("Extracting BaseSystem.dmg...")
+            # No files to delete here - let's extract the next part
+            out = self.r.run({"args":[self.z_path, "e", "*.dmg", "*/Base*.dmg"]})
+            if out[2] != 0:
+                shutil.rmtree(temp,ignore_errors=True)
+                print("An error occurred extracting: {}".format(out[2]))
+                print("")
+                self.u.grab("Press [enter] to return...")
+                return
+            # If we got here - we should delete everything in the temp folder except
+            # for a .dmg that starts with Base
+            del_list = [x for x in os.listdir(temp) if not (x.lower().startswith("base") and x.lower().endswith(".dmg"))]
+            for d in del_list:
+                os.remove(os.path.join(temp, d))
         # Onto the last command
         print("Extracting hfs...")
-        out = self.r.run({"args":[self.z_path, "e", "-tdmg", "Base*.dmg", "*.hfs"]})
+        out = self.r.run({"args":[self.z_path, "e", "-tdmg", path if path.lower().endswith(".dmg") else "Base*.dmg", "*.hfs"]})
         if out[2] != 0:
             shutil.rmtree(temp,ignore_errors=True)
             print("An error occurred extracting: {}".format(out[2]))
@@ -403,10 +427,10 @@ class WinUSB:
             print("")
             self.u.grab("Press [enter] to return...")
         else:
-            self.dd_image(disk, os.path.join(temp, hfs), clover_version)
+            self.dd_image(disk, os.path.join(temp, hfs), clover_version, local_file=local_file)
         shutil.rmtree(temp,ignore_errors=True)
 
-    def dd_image(self, disk, image, clover_version = None):
+    def dd_image(self, disk, image, clover_version = None, local_file = None):
         # Let's dd the shit out of our disk
         self.u.head("Copying Image To Drive")
         print("")
@@ -422,7 +446,7 @@ class WinUSB:
         args = [
             os.path.join(self.s_path, self.dd_name),
             "if={}".format(image),
-            "of=\\\\?\\Device\Harddisk{}\Partition2".format(disk.get("index",-1)),
+            "of=\\\\?\\Device\\Harddisk{}\\Partition2".format(disk.get("index",-1)),
             "bs=8M",
             "--progress"
         ]
@@ -441,25 +465,32 @@ class WinUSB:
             self.u.grab("Press [enter] to return to the main menu...")
             return
         # Install Clover/OC to the target drive
-        if clover_version == "OpenCore": self.install_oc(disk)
-        else: self.install_clover(disk, clover_version)
+        if clover_version == "OpenCore": self.install_oc(disk, local_file=local_file)
+        else: self.install_clover(disk, clover_version, local_file=local_file)
 
-    def install_oc(self, disk):
+    def install_oc(self, disk, local_file = None):
         self.u.head("Installing OpenCore")
         print("")
         print("Gathering info...")
-        o = self.get_oc_dl_info()
-        if o == None:
-            print(" - Error communicating with github!")
-            print("")
-            self.u.grab("Press [enter] to return...")
-            return
-        print(" - Got {}".format(o.get("name","Unknown Version")))
-        print("Downloading...")
-        temp = tempfile.mkdtemp()
-        os.chdir(temp)
-        oc_zip = o["name"]
-        self.dl.stream_to_file(o["url"], os.path.join(temp, o["name"]))
+        if not local_file:
+            o = self.get_oc_dl_info()
+            if o is None:
+                print(" - Error communicating with github!")
+                print("")
+                self.u.grab("Press [enter] to return...")
+                return
+            print(" - Got {}".format(o.get("name","Unknown Version")))
+            print("Downloading...")
+            temp = tempfile.mkdtemp()
+            os.chdir(temp)
+            self.dl.stream_to_file(o["url"], os.path.join(temp, o["name"]))
+        else:
+            print("Using local file: {}".format(local_file))
+            temp = tempfile.mkdtemp()
+            os.chdir(temp)
+            o = {"name":os.path.basename(local_file)}
+            # Copy to the temp folder
+            shutil.copy(local_file,os.path.join(temp,o["name"]))
         print("") # Empty space to clear the download progress
         if not os.path.exists(os.path.join(temp, o["name"])):
             shutil.rmtree(temp,ignore_errors=True)
@@ -467,6 +498,7 @@ class WinUSB:
             print("")
             self.u.grab("Press [enter] to return...")
             return
+        oc_zip = o["name"]
         # Got a valid file in our temp dir
         print("Extracting {}...".format(oc_zip))
         out = self.r.run({"args":[self.z_path, "x", os.path.join(temp,oc_zip)]})
@@ -478,9 +510,25 @@ class WinUSB:
             return
         # We need to also gather our boot, boot0af, and boot1f32 files
         print("Gathering DUET boot files...")
-        for x in (self.oc_boot,self.oc_boot0,self.oc_boot1):
-            print(" - {}".format(x))
-            self.dl.stream_to_file(self.oc_boot_url + x, os.path.join(temp,x),False)
+        uefi_only = False
+        duet_loc = os.path.join(temp,"Utilities","LegacyBoot")
+        for x in (self.oc_boot,self.oc_boot_alt,self.oc_boot0,self.oc_boot1):
+            # Check the local dir first
+            if os.path.exists(os.path.join(duet_loc,x)):
+                print(" - {}".format(x))
+                # Copy it over
+                target_name = self.oc_boot if x == self.oc_boot_alt else x
+                shutil.copy(os.path.join(duet_loc,x), os.path.join(temp,target_name))
+        missing_list = [x for x in (self.oc_boot,self.oc_boot0,self.oc_boot1) if not os.path.exists(os.path.join(temp,x))]
+        if missing_list:
+            print(" - Missing: {}".format(", ".join(missing_list)))
+            print("Attempting to download...")
+            for x in missing_list:
+                print(" - {}".format(x))
+                self.dl.stream_to_file(self.oc_boot_url + x, os.path.join(temp,x),False)
+            if not all((os.path.exists(os.path.join(temp,x)) for x in missing_list)):
+                print("Could not located all required DUET files - USB will be UEFI ONLY")
+                uefi_only = True
         # At this point, we should have a boot0xx file and an EFI folder in the temp dir
         # We need to udpate the disk list though - to reflect the current file system on part 1
         # of our current disk
@@ -488,7 +536,7 @@ class WinUSB:
         # Some users are having issues with the "partitions" key not populating - possibly a 3rd party disk management soft?
         # Possibly a bad USB?
         # We'll see if the key exists - if not, we'll throw an error.
-        if self.d.disks[str(disk["index"])].get("partitions",None) == None:
+        if self.d.disks[str(disk["index"])].get("partitions",None) is None:
             # No partitions found.
             shutil.rmtree(temp,ignore_errors=True)
             print("No partitions located on disk!")
@@ -496,7 +544,7 @@ class WinUSB:
             self.u.grab("Press [enter] to return...")
             return
         part = self.d.disks[str(disk["index"])]["partitions"].get("0",{}).get("letter",None) # get the first partition's letter
-        if part == None:
+        if part is None:
             shutil.rmtree(temp,ignore_errors=True)
             print("Lost original disk - or formatting failed!")
             print("")
@@ -506,50 +554,61 @@ class WinUSB:
         # will be the first partition
         # Let's copy over the EFI folder and then dd the boot0xx file
         print("Copying EFI folder to {}/EFI...".format(part))
+        source_efi = None
+        if os.path.exists(os.path.join(temp,"EFI")):
+            source_efi = os.path.join(temp,"EFI")
+        elif os.path.exists(os.path.join(temp,"X64","EFI")):
+            source_efi = os.path.join(temp,"X64","EFI")
+        if not source_efi:
+            print(" - Source EFI not found!")
+            print("")
+            self.u.grab("Press [enter] to return...")
+            return
         if os.path.exists("{}/EFI".format(part)):
             print(" - EFI exists - removing...")
             shutil.rmtree("{}/EFI".format(part),ignore_errors=True)
             time.sleep(1) # Added because windows is dumb
-        shutil.copytree(os.path.join(temp,"X64","EFI"), "{}/EFI".format(part))
-        # Copy boot over to the root of the EFI volume
-        print("Copying {} to {}/boot...".format(self.oc_boot,part))
-        shutil.copy(os.path.join(temp,self.oc_boot),"{}/boot".format(part))
-        # Use bootice to update the MBR and PBR - always on the first
-        # partition (which is 0 in bootice)
-        print("Updating the MBR with {}...".format(self.oc_boot0))
-        args = [
-            os.path.join(self.s_path,self.bi_name),
-            "/device={}".format(disk.get("index",-1)),
-            "/mbr",
-            "/restore",
-            "/file={}".format(os.path.join(temp,self.oc_boot0)),
-            "/keep_dpt",
-            "/quiet"
-        ]
-        out = self.r.run({"args":args})
-        if out[2] != 0:
-            shutil.rmtree(temp,ignore_errors=True)
-            print(" - An error occurred updating the MBR: {}".format(out[2]))
-            print("")
-            self.u.grab("Press [enter] to return...")
-            return
-        print("Updating the PBR with {}...".format(self.oc_boot1))
-        args = [
-            os.path.join(self.s_path,self.bi_name),
-            "/device={}:0".format(disk.get("index",-1)),
-            "/pbr",
-            "/restore",
-            "/file={}".format(os.path.join(temp,self.oc_boot1)),
-            "/keep_bpb",
-            "/quiet"
-        ]
-        out = self.r.run({"args":args})
-        if out[2] != 0:
-            shutil.rmtree(temp,ignore_errors=True)
-            print(" - An error occurred updating the PBR: {}".format(out[2]))
-            print("")
-            self.u.grab("Press [enter] to return...")
-            return
+        shutil.copytree(source_efi, "{}/EFI".format(part))
+        if not uefi_only:
+            # Copy boot over to the root of the EFI volume
+            print("Copying {} to {}/boot...".format(self.oc_boot,part))
+            shutil.copy(os.path.join(temp,self.oc_boot),"{}/boot".format(part))
+            # Use bootice to update the MBR and PBR - always on the first
+            # partition (which is 0 in bootice)
+            print("Updating the MBR with {}...".format(self.oc_boot0))
+            args = [
+                os.path.join(self.s_path,self.bi_name),
+                "/device={}".format(disk.get("index",-1)),
+                "/mbr",
+                "/restore",
+                "/file={}".format(os.path.join(temp,self.oc_boot0)),
+                "/keep_dpt",
+                "/quiet"
+            ]
+            out = self.r.run({"args":args})
+            if out[2] != 0:
+                shutil.rmtree(temp,ignore_errors=True)
+                print(" - An error occurred updating the MBR: {}".format(out[2]))
+                print("")
+                self.u.grab("Press [enter] to return...")
+                return
+            print("Updating the PBR with {}...".format(self.oc_boot1))
+            args = [
+                os.path.join(self.s_path,self.bi_name),
+                "/device={}:0".format(disk.get("index",-1)),
+                "/pbr",
+                "/restore",
+                "/file={}".format(os.path.join(temp,self.oc_boot1)),
+                "/keep_bpb",
+                "/quiet"
+            ]
+            out = self.r.run({"args":args})
+            if out[2] != 0:
+                shutil.rmtree(temp,ignore_errors=True)
+                print(" - An error occurred updating the PBR: {}".format(out[2]))
+                print("")
+                self.u.grab("Press [enter] to return...")
+                return
         print("Cleaning up...")
         shutil.rmtree(temp,ignore_errors=True)
         print("")
@@ -557,23 +616,30 @@ class WinUSB:
         print("")
         self.u.grab("Press [enter] to return to the main menu...")
 
-    def install_clover(self, disk, clover_version = None):
+    def install_clover(self, disk, clover_version = None, local_file = None):
         self.u.head("Installing Clover - {}".format("Latest" if not clover_version else "r"+clover_version))
         print("")
         print("Gathering info...")
-        c = self.get_dl_info(clover_version)
-        if c == None:
-            if clover_version == None: print(" - Error communicating with github!")
-            else: print(" - Error gathering info for Clover r{}".format(clover_version))
-            print("")
-            self.u.grab("Press [enter] to return...")
-            return
-        print(" - Got {}".format(c.get("name","Unknown Version")))
-        print("Downloading...")
-        temp = tempfile.mkdtemp()
-        os.chdir(temp)
-        clover_lzma = c["name"]
-        self.dl.stream_to_file(c["url"], os.path.join(temp, c["name"]))
+        if not local_file:
+            c = self.get_dl_info(clover_version)
+            if c is None:
+                if clover_version is None: print(" - Error communicating with github!")
+                else: print(" - Error gathering info for Clover r{}".format(clover_version))
+                print("")
+                self.u.grab("Press [enter] to return...")
+                return
+            print(" - Got {}".format(c.get("name","Unknown Version")))
+            print("Downloading...")
+            temp = tempfile.mkdtemp()
+            os.chdir(temp)
+            self.dl.stream_to_file(c["url"], os.path.join(temp, c["name"]))
+        else:
+            print("Using local file: {}".format(local_file))
+            temp = tempfile.mkdtemp()
+            os.chdir(temp)
+            c = {"name":os.path.basename(local_file)}
+            # Copy to the temp folder
+            shutil.copy(local_file,os.path.join(temp,c["name"]))
         print("") # Empty space to clear the download progress
         if not os.path.exists(os.path.join(temp, c["name"])):
             shutil.rmtree(temp,ignore_errors=True)
@@ -581,9 +647,10 @@ class WinUSB:
             print("")
             self.u.grab("Press [enter] to return...")
             return
+        clover_archive = c["name"]
         # Got a valid file in our temp dir
-        print("Extracting {}...".format(clover_lzma))
-        out = self.r.run({"args":[self.z_path, "e", os.path.join(temp,clover_lzma)]})
+        print("Extracting {}...".format(clover_archive))
+        out = self.r.run({"args":[self.z_path, "e", os.path.join(temp,clover_archive)]})
         if out[2] != 0:
             shutil.rmtree(temp,ignore_errors=True)
             print(" - An error occurred extracting: {}".format(out[2]))
@@ -592,24 +659,19 @@ class WinUSB:
             return
         # Should result in a .tar file
         clover_tar = next((x for x in os.listdir(temp) if x.lower().endswith(".tar")),None)
-        if not clover_tar:
-            shutil.rmtree(temp,ignore_errors=True)
-            print(" - No .tar archive found - aborting...")
-            print("")
-            self.u.grab("Press [enter] to return...")
-            return
-        # Got the .tar archive - get the .iso
-        print("Extracting {}...".format(clover_tar))
-        out = self.r.run({"args":[self.z_path, "e", os.path.join(temp,clover_tar)]})
-        if out[2] != 0:
-            shutil.rmtree(temp,ignore_errors=True)
-            print(" - An error occurred extracting: {}".format(out[2]))
-            print("")
-            self.u.grab("Press [enter] to return...")
-            return
+        if clover_tar:
+            # Got a .tar archive - get the .iso
+            print("Extracting {}...".format(clover_tar))
+            out = self.r.run({"args":[self.z_path, "e", os.path.join(temp,clover_tar)]})
+            if out[2] != 0:
+                shutil.rmtree(temp,ignore_errors=True)
+                print(" - An error occurred extracting: {}".format(out[2]))
+                print("")
+                self.u.grab("Press [enter] to return...")
+                return
         # Should result in a .iso file
         clover_iso = next((x for x in os.listdir(temp) if x.lower().endswith(".iso")),None)
-        if not clover_tar:
+        if not clover_iso:
             shutil.rmtree(temp,ignore_errors=True)
             print(" - No .iso found - aborting...")
             print("")
@@ -655,7 +717,7 @@ class WinUSB:
         # Some users are having issues with the "partitions" key not populating - possibly a 3rd party disk management soft?
         # Possibly a bad USB?
         # We'll see if the key exists - if not, we'll throw an error.
-        if self.d.disks[str(disk["index"])].get("partitions",None) == None:
+        if self.d.disks[str(disk["index"])].get("partitions",None) is None:
             # No partitions found.
             shutil.rmtree(temp,ignore_errors=True)
             print("No partitions located on disk!")
@@ -663,7 +725,7 @@ class WinUSB:
             self.u.grab("Press [enter] to return...")
             return
         part = self.d.disks[str(disk["index"])]["partitions"].get("0",{}).get("letter",None) # get the first partition's letter
-        if part == None:
+        if part is None:
             shutil.rmtree(temp,ignore_errors=True)
             print("Lost original disk - or formatting failed!")
             print("")
@@ -787,13 +849,16 @@ class WinUSB:
         print("")
         print("Q. Quit")
         print("")
-        print("Usage: [drive number][option (only one allowed)] r[Clover revision (optional)]\n  (eg. 1B r5092)")
-        print("  Options are as follows with precedence B > E > U > G:")
+        print("Usage: [drive number][options] r[Clover revision (optional), requires C]\n  (eg. 1B C r5092)")
+        print("  Options are as follows with precedence B > F > E > U > G:")
         print("    B = Only install the boot manager to the drive's first partition.")
-        print("    O = Use OpenCore instead of Clover.")
+        print("    F = Skip formatting the disk - will install the boot manager to the first")
+        print("        partition, and dd the recovery image to the second.")
         print("    E = Sets the type of the drive's first partition to EFI.")
         print("    U = Similar to E, but sets the type to Basic Data (useful for editing).")
         print("    G = Format as GPT (default is MBR).")
+        print("    C = Use Clover instead of OpenCore.")
+        print("    L = Provide a local archive for the boot manager - must still use C if Clover.")
         print("    D = Used without a drive number, toggles showing all disks (currently {}).".format("ENABLED" if self.show_all_disks else "DISABLED"))
         print("")
         menu = self.u.grab("Please select a disk or press [enter] with no options to refresh:  ")
@@ -806,12 +871,16 @@ class WinUSB:
             self.show_all_disks ^= True
             self.main()
             return
-        only_boot = use_oc = set_efi = unset_efi = use_gpt = False
+        only_boot = set_efi = unset_efi = use_gpt = user_provided = no_format = False
+        local_file = None
+        use_oc = True
         if "b" in menu.lower():
             only_boot = True
             menu = menu.lower().replace("b","")
-        if "o" in menu.lower():
-            use_oc = True
+        if "c" in menu.lower():
+            use_oc = False
+            menu = menu.lower().replace("c","")
+        if "o" in menu.lower(): # Remove legacy "o" value
             menu = menu.lower().replace("o","")
         if "e" in menu.lower():
             set_efi = True
@@ -822,6 +891,12 @@ class WinUSB:
         if "g" in menu.lower():
             use_gpt = True
             menu = menu.lower().replace("g","")
+        if "l" in menu.lower():
+            user_provided = True
+            menu = menu.lower().replace("l","")
+        if "f" in menu.lower():
+            no_format = True
+            menu = menu.lower().replace("f","")
 
         # Extract Clover version from args if found
         clover_list = [x for x in menu.split() if x.lower().startswith("r") and all(y in "0123456789" for y in x[1:])]
@@ -841,9 +916,64 @@ class WinUSB:
             self.main()
             return
         # Got a disk!
+        if user_provided:
+            # Prompt the user for the target archive
+            while True:
+                self.u.head("Local Archive")
+                print("")
+                if use_oc:
+                    print("NOTE:  OpenCore archives are expected to be .zip!")
+                else:
+                    print("NOTE:  Clover archives are expected to be an ISO packed in either .tar.lzma or .7z!")
+                print("")
+                print("M. Return to the menu")
+                print("Q. Quit")
+                print("")
+                print("(To copy a file's path, shift + right-click in Explorer and select 'Copy as path')\n")
+                l = self.u.grab("Please {} archive path here:  ".format("OpenCore" if use_oc else "Clover"))
+                if not len(l):
+                    continue
+                if l.lower() == "m":
+                    break
+                elif l.lower() == "q":
+                    self.u.custom_quit()
+                l_check = self.u.check_path(l)
+                if not l_check or not l_check.lower().endswith(".zip" if use_oc else (".tar.lzma",".7z")):
+                    continue
+                # Got a valid path that ends with the proper extension
+                local_file = l_check
+                break
+            # Check if we got something
+            if not local_file:
+                self.main()
+                return
         if only_boot:
-            if use_oc: self.install_oc(selected_disk)
-            else: self.install_clover(selected_disk, clover_version)
+            if use_oc: self.install_oc(selected_disk, local_file=local_file)
+            else: self.install_clover(selected_disk, clover_version, local_file=local_file)
+        elif no_format:
+            # Make sure we warn the user that the second partition **NEEDS** to be a RAW
+            # partition for dd to properly work
+            while True:
+                self.u.head("WARNING")
+                print("")
+                print("{}. {} - {} ({})".format(
+                    selected_disk.get("index",-1), 
+                    selected_disk.get("model","Unknown"), 
+                    self.dl.get_size(selected_disk.get("size",-1),strip_zeroes=True),
+                    ["Unknown","No Root Dir","Removable","Local","Network","Disc","RAM Disk"][selected_disk.get("type",0)]
+                    ))
+                print("")
+                print("In order to continue without formatting, the selected disk's first")
+                print("partition MUST be FAT32, and the second MUST be RAW.  If that is not")
+                print("the case, the operation WILL fail.")
+                print("")
+                yn = self.u.grab("Continue? (y/n):  ")
+                if yn.lower() == "n":
+                    self.main()
+                    return
+                if yn.lower() == "y":
+                    break
+            self.select_package(selected_disk, clover_version, local_file=local_file)
         elif set_efi:
             self.diskpart_flag(selected_disk, True)
         elif unset_efi:
@@ -871,7 +1001,7 @@ class WinUSB:
                 if yn.lower() == "y":
                     break
             # Got the OK to erase!  Let's format a diskpart script!
-            self.diskpart_erase(selected_disk, use_gpt, clover_version)
+            self.diskpart_erase(selected_disk, use_gpt, clover_version, local_file=local_file)
         self.main()
 
 if __name__ == '__main__':

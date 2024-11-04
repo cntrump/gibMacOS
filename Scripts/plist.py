@@ -91,8 +91,18 @@ def load(fp, fmt=None, use_builtin_types=None, dict_type=dict):
             # Monkey patch!
             def end_integer():
                 d = p.get_data()
-                p.add_object(int(d,16) if d.lower().startswith("0x") else int(d))
+                value = int(d,16) if d.lower().startswith("0x") else int(d)
+                if -1 << 63 <= value < 1 << 63:
+                    p.add_object(value)
+                else:
+                    raise OverflowError("Integer overflow at line {}".format(p.parser.CurrentLineNumber))
+            def end_data():
+                try:
+                    p.add_object(plistlib._decode_base64(p.get_data()))
+                except Exception as e:
+                    raise Exception("Data error at line {}: {}".format(p.parser.CurrentLineNumber,e))
             p.end_integer = end_integer
+            p.end_data = end_data
         return p.parse(fp)
     elif not _is_binary(fp):
         # Is not binary - assume a string - and try to load
@@ -103,20 +113,37 @@ def load(fp, fmt=None, use_builtin_types=None, dict_type=dict):
         # Create a new PlistParser object - then we need to set up
         # the values and parse.
         p = plistlib.PlistParser()
-        # We also need to monkey patch this to allow for other dict_types
+        parser = ParserCreate()
+        parser.StartElementHandler = p.handleBeginElement
+        parser.EndElementHandler = p.handleEndElement
+        parser.CharacterDataHandler = p.handleData
+        # We also need to monkey patch this to allow for other dict_types, hex int support
+        # proper line output for data errors, and for unicode string decoding
         def begin_dict(attrs):
             d = dict_type()
             p.addObject(d)
             p.stack.append(d)
         def end_integer():
             d = p.getData()
-            p.addObject(int(d,16) if d.lower().startswith("0x") else int(d))
+            value = int(d,16) if d.lower().startswith("0x") else int(d)
+            if -1 << 63 <= value < 1 << 63:
+                p.addObject(value)
+            else:
+                raise OverflowError("Integer overflow at line {}".format(parser.CurrentLineNumber))
+        def end_data():
+            try:
+                p.addObject(plistlib.Data.fromBase64(p.getData()))
+            except Exception as e:
+                raise Exception("Data error at line {}: {}".format(parser.CurrentLineNumber,e))
+        def end_string():
+            d = p.getData()
+            if isinstance(d,unicode):
+                d = d.encode("utf-8")
+            p.addObject(d)
         p.begin_dict = begin_dict
         p.end_integer = end_integer
-        parser = ParserCreate()
-        parser.StartElementHandler = p.handleBeginElement
-        parser.EndElementHandler = p.handleEndElement
-        parser.CharacterDataHandler = p.handleData
+        p.end_data = end_data
+        p.end_string = end_string
         if isinstance(fp, unicode):
             # Encode unicode -> string; use utf-8 for safety
             fp = fp.encode("utf-8")
@@ -142,8 +169,8 @@ def loads(value, fmt=None, use_builtin_types=None, dict_type=dict):
     try:
         return load(BytesIO(value),fmt=fmt,use_builtin_types=use_builtin_types,dict_type=dict_type)
     except:
-       # Python 3.9 removed use_builtin_types
-       return load(BytesIO(value),fmt=fmt,dict_type=dict_type)
+        # Python 3.9 removed use_builtin_types
+        return load(BytesIO(value),fmt=fmt,dict_type=dict_type)
 def dump(value, fp, fmt=FMT_XML, sort_keys=True, skipkeys=False):
     if _check_py3():
         plistlib.dump(value, fp, fmt=fmt, sort_keys=sort_keys, skipkeys=skipkeys)
